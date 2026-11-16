@@ -5,7 +5,7 @@ type Color = "red" | "yellow" | "green" | "blue";
 type Kind = "number" | "skip" | "reverse" | "draw2" | "wild" | "draw4";
 type Card = { id: string; color: Color | "wild"; kind: Kind; value?: number };
 type Player = { id: string; name: string; hand: Card[]; connected: boolean; disconnectedAt?: number; unoCalled: boolean };
-type GameNotice = { id: string; playerId: string; count: number; reason: "draw" | "penalty" | "autoPenalty" | "uno" | "challengeSuccess" | "challengeFailed"; otherPlayerId?: string };
+type GameNotice = { id: string; playerId: string; count: number; reason: "draw" | "penalty" | "autoPenalty" | "uno" | "unoCall" | "challengeSuccess" | "challengeFailed"; otherPlayerId?: string };
 type Game = {
   deck: Card[]; discard: Card[]; current: number; direction: 1 | -1; color: Color; pendingDraw: number;
   challenge: null | { offenderId: string; challengerId: string; colorBefore: Color };
@@ -253,6 +253,7 @@ export class GameRoom extends DurableObject<Env> {
       if (game.unoWindowPlayerId !== playerId) throw new Error("Call UNO right after playing down to one card.");
       player.unoCalled = true;
       delete game.unoWindowPlayerId;
+      game.notices.push({ id: crypto.randomUUID(), playerId, count: 0, reason: "unoCall" });
       return;
     }
     if (action.type === "catchUno") {
@@ -398,6 +399,7 @@ export class GameRoom extends DurableObject<Env> {
         drawnCardId: game.drawnCardId, winnerId: game.winnerId, deckCount: game.deck.length,
         notices: (game.notices ?? []).map((notice) => {
           const playerName = state.players.find((player) => player.id === notice.playerId)?.name ?? "A player";
+          if (notice.reason === "unoCall") return { id: notice.id, kind: "unoCall", text: notice.playerId === playerId ? "You called UNO! One card left." : `${playerName} calls UNO!` };
           if (notice.reason === "uno") return { id: notice.id, text: notice.playerId === playerId ? "You missed UNO! +2 cards added to your hand." : `${playerName} forgot UNO and picked up +2.` };
           if (notice.reason === "autoPenalty") return { id: notice.id, text: notice.playerId === playerId ? `No +2 or +4 to stack — +${notice.count} cards added automatically. Your turn is skipped.` : `${playerName} had no +2 or +4 to stack and drew +${notice.count}.` };
           if (notice.reason === "penalty") return { id: notice.id, text: notice.playerId === playerId ? `+${notice.count} for you! ${notice.count} cards added to your hand.` : `${playerName} picked up +${notice.count} cards.` };
