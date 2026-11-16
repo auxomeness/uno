@@ -5,10 +5,9 @@ type Color = "red" | "yellow" | "green" | "blue";
 type Kind = "number" | "skip" | "reverse" | "draw2" | "wild" | "draw4";
 type Card = { id: string; color: Color | "wild"; kind: Kind; value?: number };
 type Player = { id: string; name: string; hand: Card[]; connected: boolean; disconnectedAt?: number; unoCalled: boolean };
-type GameNotice = { id: string; playerId: string; count: number; reason: "draw" | "penalty" | "autoPenalty" | "uno" | "unoCall" | "challengeSuccess" | "challengeFailed"; otherPlayerId?: string };
+type GameNotice = { id: string; playerId: string; count: number; reason: "draw" | "penalty" | "autoPenalty" | "finalPenalty" | "uno" | "unoCall" };
 type Game = {
   deck: Card[]; discard: Card[]; current: number; direction: 1 | -1; color: Color; pendingDraw: number;
-  challenge: null | { offenderId: string; challengerId: string; colorBefore: Color };
   hasDrawn: boolean; drawnCardId?: string; unoWindowPlayerId?: string; notices: GameNotice[]; status: "playing" | "finished"; winnerId?: string;
 };
 type RoomState = {
@@ -51,6 +50,11 @@ function playable(card: Card, game: Game): boolean {
   if (game.pendingDraw > 0) return card.kind === "draw2" || card.kind === "draw4";
   const top = game.discard.at(-1)!;
   return card.kind === "wild" || card.kind === "draw4" || card.color === game.color || (card.kind === top.kind && card.kind !== "number") || (card.kind === "number" && top.kind === "number" && card.value === top.value);
+}
+
+function legalForPlayer(player: Player, card: Card, game: Game): boolean {
+  if (!playable(card, game)) return false;
+  return !(card.kind === "draw4" && game.pendingDraw === 0 && player.hand.some((held) => held.id !== card.id && held.color === game.color));
 }
 
 function nextIndex(game: Game, count: number, steps = 1) { return wrap(game.current + game.direction * steps, count); }
@@ -207,7 +211,7 @@ export class GameRoom extends DurableObject<Env> {
     for (const p of state.players) { p.hand = deck.splice(0, 7); p.unoCalled = true; }
     const first = deck.findIndex((card) => card.kind === "number");
     const [starter] = deck.splice(first, 1);
-    const game: Game = { deck, discard: [starter], current: 0, direction: 1, color: starter.color as Color, pendingDraw: 0, challenge: null, hasDrawn: false, notices: [], status: "playing" };
+    const game: Game = { deck, discard: [starter], current: 0, direction: 1, color: starter.color as Color, pendingDraw: 0, hasDrawn: false, notices: [], status: "playing" };
     state.game = game; state.status = "playing";
   }
 
@@ -235,7 +239,6 @@ export class GameRoom extends DurableObject<Env> {
       if (index < game.current) game.current--;
       else if (index === game.current) game.current = wrap(game.current, state.players.length);
       game.hasDrawn = false; delete game.drawnCardId;
-      if (game.challenge?.offenderId === playerId || game.challenge?.challengerId === playerId) { game.challenge = null; game.pendingDraw = 0; }
     }
   }
 
@@ -277,37 +280,30 @@ export class GameRoom extends DurableObject<Env> {
       delete game.unoWindowPlayerId;
     }
 
-    if (action.type === "challenge") {
-      const challenge = game.challenge;
-      if (!challenge || challenge.challengerId !== playerId) throw new Error("There is no Wild Draw Four to challenge.");
-      const offender = state.players.find((p) => p.id === challenge.offenderId)!;
-      const guilty = offender.hand.some((card) => card.color === challenge.colorBefore);
-      if (guilty) {
-        this.drawCards(state, offender, 4);
-        game.notices.push({ id: crypto.randomUUID(), playerId: challenge.challengerId, otherPlayerId: offender.id, count: 4, reason: "challengeSuccess" });
-        game.pendingDraw = 0; game.challenge = null; game.hasDrawn = false; delete game.drawnCardId;
-      } else {
-        this.drawCards(state, player, 6);
-        game.notices.push({ id: crypto.randomUUID(), playerId: player.id, otherPlayerId: offender.id, count: 6, reason: "challengeFailed" });
-        game.pendingDraw = 0; game.challenge = null; game.current = nextIndex(game, state.players.length); game.hasDrawn = false; delete game.drawnCardId;
-      }
-      return;
-    }
     if (action.type === "draw") {
       if (game.pendingDraw > 0) {
-        if (game.challenge) game.challenge = null;
         const penalty = game.pendingDraw;
         this.drawCards(state, player, penalty);
         game.notices.push({ id: crypto.randomUUID(), playerId: player.id, count: penalty, reason: "penalty" });
         game.pendingDraw = 0; game.current = nextIndex(game, state.players.length); game.hasDrawn = false; delete game.drawnCardId;
         return;
       }
-      if (game.hasDrawn) throw new Error("You already drew a card this turn.");
-      if (!game.deck.length) this.recycle(game);
-      const card = game.deck.pop();
-      if (!card) throw new Error("There are no cards left to draw.");
-      player.hand.push(card); game.hasDrawn = true; game.drawnCardId = card.id;
-      game.notices.push({ id: crypto.randomUUID(), playerId: player.id, count: 1, reason: "draw" });
+      if (game.hasDrawn) throw new Error("You already drew this turn.");
+      if (player.hand.some((card) => legalForPlayer(player, card, game))) throw new Error("Play a matching card before drawing.");
+      let lastDrawn: Card | undefined;
+      let drawnCount = 0;
+      while (true) {
+        if (!game.deck.length) this.recycle(game);
+        const card = game.deck.pop();
+        if (!card) break;
+        player.hand.push(card);
+        lastDrawn = card;
+        drawnCount++;
+        if (legalForPlayer(player, card, game)) break;
+      }
+      if (!drawnCount || !lastDrawn) throw new Error("There are no cards left to draw.");
+      game.hasDrawn = true; game.drawnCardId = lastDrawn.id;
+      game.notices.push({ id: crypto.randomUUID(), playerId: player.id, count: drawnCount, reason: "draw" });
       return;
     }
     if (action.type === "pass") {
@@ -320,15 +316,26 @@ export class GameRoom extends DurableObject<Env> {
     if (cardIndex < 0) throw new Error("That card is not in your hand.");
     const card = player.hand[cardIndex];
     if (game.hasDrawn && card.id !== game.drawnCardId) throw new Error("After drawing, you may only play the card you just drew.");
-    if (!playable(card, game)) throw new Error("That card does not match the top card.");
+    if (!legalForPlayer(player, card, game)) {
+      if (card.kind === "draw4" && game.pendingDraw === 0 && player.hand.some((held) => held.id !== card.id && held.color === game.color)) throw new Error("You can only play a Wild +4 when you have no cards of the current color.");
+      throw new Error("That card does not match the top card.");
+    }
     if ((card.kind === "wild" || card.kind === "draw4") && !COLORS.includes(action.color as Color)) throw new Error("Choose a color for your wild card.");
 
-    const wasPenalty = game.pendingDraw > 0;
-    const oldColor = game.color;
     player.hand.splice(cardIndex, 1);
     game.discard.push(card);
     game.hasDrawn = false; delete game.drawnCardId;
+    if (card.kind === "draw2" || card.kind === "draw4") game.pendingDraw += card.kind === "draw2" ? 2 : 4;
     if (!player.hand.length) {
+      if (game.pendingDraw > 0) {
+        const next = nextIndex(game, state.players.length);
+        const recipient = state.players[next];
+        const count = game.pendingDraw;
+        this.drawCards(state, recipient, count);
+        game.notices.push({ id: crypto.randomUUID(), playerId: recipient.id, count, reason: "finalPenalty" });
+        game.current = next;
+        game.pendingDraw = 0;
+      }
       game.status = "finished"; game.winnerId = player.id; state.status = "finished";
       return;
     }
@@ -338,15 +345,12 @@ export class GameRoom extends DurableObject<Env> {
     else game.color = card.color;
 
     if (card.kind === "draw2" || card.kind === "draw4") {
-      game.pendingDraw += card.kind === "draw2" ? 2 : 4;
       const offenderNext = nextIndex(game, state.players.length);
-      if (card.kind === "draw4" && !wasPenalty) game.challenge = { offenderId: player.id, challengerId: state.players[offenderNext].id, colorBefore: oldColor };
-      else if (wasPenalty) game.challenge = null;
       game.current = offenderNext;
       this.resolveUnstackablePenalty(state);
       return;
     }
-    game.pendingDraw = 0; game.challenge = null;
+    game.pendingDraw = 0;
     if (card.kind === "skip") game.current = nextIndex(game, state.players.length, 2);
     else if (card.kind === "reverse") {
       game.direction = game.direction === 1 ? -1 : 1;
@@ -373,7 +377,6 @@ export class GameRoom extends DurableObject<Env> {
     this.drawCards(state, player, penalty);
     game.notices.push({ id: crypto.randomUUID(), playerId: player.id, count: penalty, reason: "autoPenalty" });
     game.pendingDraw = 0;
-    game.challenge = null;
     game.current = nextIndex(game, state.players.length);
     game.hasDrawn = false;
     delete game.drawnCardId;
@@ -395,22 +398,16 @@ export class GameRoom extends DurableObject<Env> {
       players: state.players.map((player, index) => ({ id: player.id, name: player.name, cardCount: player.hand.length, hand: player.id === playerId ? player.hand : undefined, connected: player.connected, unoCalled: player.unoCalled, isCurrent: !!game && game.current === index })),
       game: game ? {
         status: game.status, discard: game.discard.at(-1), currentColor: game.color, direction: game.direction, pendingDraw: game.pendingDraw,
-        challengeAvailable: game.challenge?.challengerId === playerId, hasDrawn: game.current === state.players.findIndex((p) => p.id === playerId) && game.hasDrawn,
+        hasDrawn: game.current === state.players.findIndex((p) => p.id === playerId) && game.hasDrawn,
         drawnCardId: game.drawnCardId, winnerId: game.winnerId, deckCount: game.deck.length,
         notices: (game.notices ?? []).map((notice) => {
           const playerName = state.players.find((player) => player.id === notice.playerId)?.name ?? "A player";
           if (notice.reason === "unoCall") return { id: notice.id, kind: "unoCall", text: notice.playerId === playerId ? "You called UNO! One card left." : `${playerName} calls UNO!` };
           if (notice.reason === "uno") return { id: notice.id, text: notice.playerId === playerId ? "You missed UNO! +2 cards added to your hand." : `${playerName} forgot UNO and picked up +2.` };
+          if (notice.reason === "finalPenalty") return { id: notice.id, text: notice.playerId === playerId ? `Final +${notice.count}: you drew ${notice.count} cards before the round ended.` : `${playerName} drew ${notice.count} cards from the final +${notice.count}.` };
           if (notice.reason === "autoPenalty") return { id: notice.id, text: notice.playerId === playerId ? `No +2 or +4 to stack — +${notice.count} cards added automatically. Your turn is skipped.` : `${playerName} had no +2 or +4 to stack and drew +${notice.count}.` };
           if (notice.reason === "penalty") return { id: notice.id, text: notice.playerId === playerId ? `+${notice.count} for you! ${notice.count} cards added to your hand.` : `${playerName} picked up +${notice.count} cards.` };
-          if (notice.reason === "challengeSuccess") {
-            const offenderName = state.players.find((player) => player.id === notice.otherPlayerId)?.name ?? "The player";
-            return { id: notice.id, text: notice.playerId === playerId ? `Challenge successful! ${offenderName} takes +4; your turn continues.` : notice.otherPlayerId === playerId ? `Your +4 was illegal. Draw 4 cards; ${playerName} keeps their turn.` : `${offenderName} drew 4 after ${playerName} caught an illegal +4.` };
-          }
-          if (notice.reason === "challengeFailed") {
-            const offenderName = state.players.find((player) => player.id === notice.otherPlayerId)?.name ?? "The player";
-            return { id: notice.id, text: notice.playerId === playerId ? `Challenge failed — the +4 was legal. You drew 6 cards and lost your turn.` : `${playerName}'s challenge failed; ${offenderName}'s +4 was legal.` };
-          }
+          if (notice.reason === "draw") return { id: notice.id, text: notice.playerId === playerId ? (notice.count === 1 ? "You found a playable card." : `You drew ${notice.count} cards and found one you can play.`) : `${playerName} drew ${notice.count} card${notice.count === 1 ? "" : "s"} to find a playable card.` };
           return { id: notice.id, text: notice.playerId === playerId ? "You drew a card." : `${playerName} drew a card.` };
         }),
       } : undefined,

@@ -6,6 +6,6 @@ export type GameNotice = { id: string; text: string; kind?: "unoCall" };
 export type RoomView = {
   id: string; code: string; name: string; visibility: "public" | "private"; status: "waiting" | "playing" | "finished";
   hostId: string; you: string; players: PlayerView[];
-  game?: { status: "playing" | "finished"; discard?: Card; currentColor: Color; direction: 1 | -1; pendingDraw: number; challengeAvailable: boolean; hasDrawn: boolean; drawnCardId?: string; winnerId?: string; deckCount: number; notices?: GameNotice[] };
+  game?: { status: "playing" | "finished"; discard?: Card; currentColor: Color; direction: 1 | -1; pendingDraw: number; hasDrawn: boolean; drawnCardId?: string; winnerId?: string; deckCount: number; notices?: GameNotice[] };
 };
 export type RoomListing = { id: string; code: string; name: string; hostName: string; players: number; maxPlayers: number; visibility: "public" | "private"; status: "waiting" | "playing" | "finished" };
