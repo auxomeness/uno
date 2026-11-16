@@ -5,7 +5,7 @@ type Color = "red" | "yellow" | "green" | "blue";
 type Kind = "number" | "skip" | "reverse" | "draw2" | "wild" | "draw4";
 type Card = { id: string; color: Color | "wild"; kind: Kind; value?: number };
 type Player = { id: string; name: string; hand: Card[]; connected: boolean; disconnectedAt?: number; unoCalled: boolean };
-type GameNotice = { id: string; playerId: string; count: number; reason: "draw" | "penalty" | "uno" | "challenge" };
+type GameNotice = { id: string; playerId: string; count: number; reason: "draw" | "penalty" | "autoPenalty" | "uno" | "challengeSuccess" | "challengeFailed"; otherPlayerId?: string };
 type Game = {
   deck: Card[]; discard: Card[]; current: number; direction: 1 | -1; color: Color; pendingDraw: number;
   challenge: null | { offenderId: string; challengerId: string; colorBefore: Color };
@@ -96,6 +96,10 @@ export class GameRoom extends DurableObject<Env> {
     if (url.pathname === "/state" && request.method === "GET") {
       const playerId = url.searchParams.get("playerId") ?? "";
       if (!state.players.some((p) => p.id === playerId)) return OTHER("You are not in this party.", 403);
+      if (this.resolveUnstackablePenalty(state)) {
+        await this.write(state);
+        this.broadcast(state);
+      }
       return Response.json(this.view(state, playerId));
     }
     if (url.pathname === "/join" && request.method === "POST") {
@@ -141,6 +145,7 @@ export class GameRoom extends DurableObject<Env> {
     const player = state.players.find((entry) => entry.id === playerId);
     if (!player) return OTHER("You are not in this party.", 403);
     player.connected = true; delete player.disconnectedAt;
+    this.resolveUnstackablePenalty(state);
     await this.write(state);
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -278,11 +283,11 @@ export class GameRoom extends DurableObject<Env> {
       const guilty = offender.hand.some((card) => card.color === challenge.colorBefore);
       if (guilty) {
         this.drawCards(state, offender, 4);
-        game.notices.push({ id: crypto.randomUUID(), playerId: offender.id, count: 4, reason: "challenge" });
+        game.notices.push({ id: crypto.randomUUID(), playerId: challenge.challengerId, otherPlayerId: offender.id, count: 4, reason: "challengeSuccess" });
         game.pendingDraw = 0; game.challenge = null; game.hasDrawn = false; delete game.drawnCardId;
       } else {
         this.drawCards(state, player, 6);
-        game.notices.push({ id: crypto.randomUUID(), playerId: player.id, count: 6, reason: "challenge" });
+        game.notices.push({ id: crypto.randomUUID(), playerId: player.id, otherPlayerId: offender.id, count: 6, reason: "challengeFailed" });
         game.pendingDraw = 0; game.challenge = null; game.current = nextIndex(game, state.players.length); game.hasDrawn = false; delete game.drawnCardId;
       }
       return;
@@ -337,6 +342,7 @@ export class GameRoom extends DurableObject<Env> {
       if (card.kind === "draw4" && !wasPenalty) game.challenge = { offenderId: player.id, challengerId: state.players[offenderNext].id, colorBefore: oldColor };
       else if (wasPenalty) game.challenge = null;
       game.current = offenderNext;
+      this.resolveUnstackablePenalty(state);
       return;
     }
     game.pendingDraw = 0; game.challenge = null;
@@ -354,6 +360,23 @@ export class GameRoom extends DurableObject<Env> {
       const card = game.deck.pop();
       if (card) player.hand.push(card);
     }
+  }
+
+  private resolveUnstackablePenalty(state: RoomState): boolean {
+    const game = state.game;
+    if (!game || game.status !== "playing" || game.pendingDraw <= 0) return false;
+    const player = state.players[game.current];
+    if (!player || player.hand.some((card) => card.kind === "draw2" || card.kind === "draw4")) return false;
+
+    const penalty = game.pendingDraw;
+    this.drawCards(state, player, penalty);
+    game.notices.push({ id: crypto.randomUUID(), playerId: player.id, count: penalty, reason: "autoPenalty" });
+    game.pendingDraw = 0;
+    game.challenge = null;
+    game.current = nextIndex(game, state.players.length);
+    game.hasDrawn = false;
+    delete game.drawnCardId;
+    return true;
   }
 
   private recycle(game: Game) {
@@ -376,8 +399,16 @@ export class GameRoom extends DurableObject<Env> {
         notices: (game.notices ?? []).map((notice) => {
           const playerName = state.players.find((player) => player.id === notice.playerId)?.name ?? "A player";
           if (notice.reason === "uno") return { id: notice.id, text: notice.playerId === playerId ? "You missed UNO! +2 cards added to your hand." : `${playerName} forgot UNO and picked up +2.` };
+          if (notice.reason === "autoPenalty") return { id: notice.id, text: notice.playerId === playerId ? `No +2 or +4 to stack — +${notice.count} cards added automatically. Your turn is skipped.` : `${playerName} had no +2 or +4 to stack and drew +${notice.count}.` };
           if (notice.reason === "penalty") return { id: notice.id, text: notice.playerId === playerId ? `+${notice.count} for you! ${notice.count} cards added to your hand.` : `${playerName} picked up +${notice.count} cards.` };
-          if (notice.reason === "challenge") return { id: notice.id, text: notice.playerId === playerId ? `Challenge resolved: ${notice.count} cards added to your hand.` : `${playerName} drew ${notice.count} cards after the challenge.` };
+          if (notice.reason === "challengeSuccess") {
+            const offenderName = state.players.find((player) => player.id === notice.otherPlayerId)?.name ?? "The player";
+            return { id: notice.id, text: notice.playerId === playerId ? `Challenge successful! ${offenderName} takes +4; your turn continues.` : notice.otherPlayerId === playerId ? `Your +4 was illegal. Draw 4 cards; ${playerName} keeps their turn.` : `${offenderName} drew 4 after ${playerName} caught an illegal +4.` };
+          }
+          if (notice.reason === "challengeFailed") {
+            const offenderName = state.players.find((player) => player.id === notice.otherPlayerId)?.name ?? "The player";
+            return { id: notice.id, text: notice.playerId === playerId ? `Challenge failed — the +4 was legal. You drew 6 cards and lost your turn.` : `${playerName}'s challenge failed; ${offenderName}'s +4 was legal.` };
+          }
           return { id: notice.id, text: notice.playerId === playerId ? "You drew a card." : `${playerName} drew a card.` };
         }),
       } : undefined,
