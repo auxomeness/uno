@@ -1,0 +1,29 @@
+{
+  "name": "uno-party",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:stack": "npm run build && concurrently -k \"wrangler dev --port 8787\" \"vite --host 0.0.0.0\"",
+    "dev:worker": "wrangler dev",
+    "build": "tsc -b && vite build",
+    "check": "tsc -b --pretty false",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "4.5.2",
+    "vite": "6.3.5",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "lucide-react": "1.73.0",
+    "concurrently": "10.0.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261116.1",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "typescript": "7.0.2",
+    "wrangler": "4.162.0"
+  }
+}
